@@ -4,9 +4,12 @@ Accepts code changes from Cursor, stores project context and code chunk debuggin
 Can be run as an MCP server (stdio) or as a FastAPI HTTP server with SSE support.
 """
 import logging
+import asyncio
+import json
+import threading
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -16,8 +19,7 @@ logger = logging.getLogger(__name__)
 from core import (
     sse_endpoint_handler,
     sse_message_handler,
-    submit_code_context,
-    send_progress_update
+    submit_code_context
 )
 from core.create_ctrlflow_json import generate_code_graph_from_context
 
@@ -31,9 +33,46 @@ from api import (
 # Initialize the MCP server (for stdio mode)
 mcp = FastMCP("Debug Context MCP Server")
 
+
+def create_progress_callback(ctx: Context):
+    """Create sync progress callback that calls async ctx.report_progress().
+    
+    This wrapper allows the synchronous graph generation function to report
+    progress via FastMCP's async ctx.report_progress() method.
+    """
+    def progress_callback(stage: str, message: str, progress: float):
+        """Sync callback that calls async ctx.report_progress()."""
+        # Convert progress (0.0-1.0) to percentage (0-100)
+        progress_percent = int(progress * 100)
+        
+        # Get or create event loop
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # Call async method from sync context
+        if loop.is_running():
+            # If loop is running, schedule coroutine
+            asyncio.create_task(ctx.report_progress(progress=progress_percent, total=100))
+        else:
+            # If no loop running, run in new task
+            try:
+                loop.run_until_complete(ctx.report_progress(progress=progress_percent, total=100))
+            except RuntimeError:
+                # If we can't run, try creating a new event loop
+                asyncio.run(ctx.report_progress(progress=progress_percent, total=100))
+        
+        # Log progress
+        logger.info(f"Progress [{stage}]: {message} ({progress_percent}%)")
+    
+    return progress_callback
+
+
 # Register MCP tool
 @mcp.tool()
-def submit_code_context_mcp(text: str) -> str:
+async def submit_code_context_mcp(text: str, ctx: Context) -> str:
     """
     Submit potential bug areas from codebase analysis. REQUIRES MULTIPLE CODE CHUNKS in sequence, each with ACTUAL CODE BLOCKS (5-10 lines), not English descriptions.
     
@@ -110,30 +149,20 @@ def submit_code_context_mcp(text: str) -> str:
             result.append(item * 2)
         return result
     """
-    # Try to get connection_id from thread-local storage or context
-    # For now, we'll attempt to get it but proceed even if None
-    # Note: FastMCP tools don't have direct access to request context,
-    # so connection_id may be None in stdio mode
-    connection_id = getattr(threading.current_thread(), 'mcp_connection_id', None)
-    
-    if connection_id:
-        logger.info(f"MCP tool called with connection_id: {connection_id}")
-    else:
-        logger.warning("MCP tool called without connection_id - progress updates will only be logged")
-    
-    # Create progress callback that sends SSE updates
-    def progress_callback(stage: str, message: str, progress: float):
-        send_progress_update(connection_id, stage, message, progress)
-        logger.info(f"Progress: {stage} - {message} ({progress:.1%}) [connection_id: {connection_id}]")
+    # Create progress callback using FastMCP Context
+    progress_callback = create_progress_callback(ctx)
     
     # Generate graph from context - this will block until complete
-    # Progress updates will be sent via SSE during processing
+    # Progress updates will be sent via FastMCP's progress mechanism
     try:
-        logger.info(f"Starting graph generation from MCP tool call [connection_id: {connection_id}]")
+        logger.info("Starting graph generation from MCP tool call")
+        
+        # Call sync graph generation function
         result = generate_code_graph_from_context(
             text,
             progress_callback=progress_callback
         )
+        
         logger.info(f"Graph generation complete: {result.get('status')}")
         
         # TODO: Add workflow orchestration functionality here
@@ -146,8 +175,10 @@ def submit_code_context_mcp(text: str) -> str:
     except Exception as e:
         error_msg = f"Error generating graph: {str(e)}"
         logger.error(error_msg)
-        if connection_id:
-            send_progress_update(connection_id, "error", error_msg, 0.0)
+        
+        # Report error progress
+        await ctx.report_progress(progress=0, total=100)
+        
         return json.dumps({
             "status": "error",
             "message": error_msg

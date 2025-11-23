@@ -23,7 +23,11 @@ def send_progress_update(
     progress: float
 ) -> None:
     """
-    Send progress update via SSE if connection available.
+    DEPRECATED: Send progress update via SSE if connection available.
+    
+    This function is deprecated. Use FastMCP's ctx.report_progress() instead
+    for progress reporting in MCP tools. This function is kept for backward
+    compatibility with non-MCP code paths.
     
     Args:
         connection_id: SSE connection ID (if None, update is ignored)
@@ -32,6 +36,7 @@ def send_progress_update(
         progress: Progress value between 0.0 and 1.0
     """
     logger_instance = logging.getLogger(__name__)
+    logger_instance.warning("send_progress_update() is deprecated. Use FastMCP's ctx.report_progress() instead.")
     
     if not connection_id or connection_id not in sse_connections:
         # No connection available, just log
